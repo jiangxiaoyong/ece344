@@ -1,0 +1,189 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <machine/pcb.h>
+#include <machine/spl.h>
+#include <machine/trapframe.h>
+#include <kern/callno.h>
+#include <syscall.h>
+#include <synch.h>
+#include <addrspace.h>
+#include <curthread.h>
+#include <machine/tlb.h>
+
+
+
+/*
+ * System call handler.
+ *
+ * A pointer to the trapframe created during exception entry (in
+ * exception.S) is passed in.
+ *
+ * The calling conventions for syscalls are as follows: Like ordinary
+ * function calls, the first 4 32-bit arguments are passed in the 4
+ * argument registers a0-a3. In addition, the system call number is
+ * passed in the v0 register.
+ *
+ * On successful return, the return value is passed back in the v0
+ * register, like an ordinary function call, and the a3 register is
+ * also set to 0 to indicate success.
+ *
+ * On an error return, the error code is passed back in the v0
+ * register, and the a3 register is set to 1 to indicate failure.
+ * (Userlevel code takes care of storing the error code in errno and
+ * returning the value -1 from the actual userlevel syscall function.
+ * See src/lib/libc/syscalls.S and related files.)
+ *
+ * Upon syscall return the program counter stored in the trapframe
+ * must be incremented by one instruction; otherwise the exception
+ * return code will restart the "syscall" instruction and the system
+ * call will repeat forever.
+ *
+ * Since none of the OS/161 system calls have more than 4 arguments,
+ * there should be no need to fetch additional arguments from the
+ * user-level stack.
+ *
+ * Watch out: if you make system calls that have 64-bit quantities as
+ * arguments, they will get passed in pairs of registers, and not
+ * necessarily in the way you expect. We recommend you don't do it.
+ * (In fact, we recommend you don't use 64-bit quantities at all. See
+ * arch/mips/include/types.h.)
+ */
+
+extern struct lock * forklock;
+extern struct lock * sys_lock;
+struct trapframe * save_trapframe;		
+
+void
+mips_syscall(struct trapframe *tf)
+{
+	int callno;
+	int32_t retval;
+	int err;
+	int retpid;
+	int wait_pid;
+	unsigned int old_break;
+
+	assert(curspl==0);
+
+       /* int s = splhigh();*/
+	callno = tf->tf_v0;
+
+	/*
+	 * Initialize retval to 0. Many of the system calls don't
+	 * really return a value, just 0 for success and -1 on
+	 * error. Since retval is the value returned on success,
+	 * initialize it to 0 by default; thus it's not necessary to
+	 * deal with it except for calls that return other values, 
+	 * like write.
+	 */
+	retval = 0;
+	switch (callno) {
+	    case SYS_reboot:
+		err = sys_reboot(tf->tf_a0);
+		break;
+
+	    /* Add stuff here */
+ 	    case SYS_write:
+		err = write(tf->tf_a0, (const void *)tf->tf_a1, tf->tf_a2);
+		break;
+
+ 	    case SYS_read:
+		err = read(tf->tf_a0, (void *)tf->tf_a1, tf->tf_a2);
+		retval = 1;
+		break;
+
+	    case SYS__exit:
+		 _exit(tf->tf_a0);
+		break;
+
+	    case SYS_fork:
+
+		err = fork(tf);
+		break;
+
+	    case SYS_getpid:
+		err = getpid(&retpid);
+		retval = retpid;
+		break;
+
+	    case SYS_waitpid:
+		err = waitpid(tf->tf_a0, (int *)tf->tf_a1, tf->tf_a2, &wait_pid);
+		retval = wait_pid;
+		break;
+
+	    case SYS_execv:
+		err = execv((const char *)tf->tf_a0, (char *const *)tf->tf_a1);
+		break;
+
+	    case SYS_sbrk:
+		err = sbrk((unsigned int)tf->tf_a0, &old_break);
+		(unsigned int *)retval = (unsigned int *)old_break;
+		break;
+	
+	    default:
+		kprintf("Unknown syscall %d\n", callno);
+		err = ENOSYS;
+		break;
+	}
+
+
+	if (err) {
+		/*
+		 * Return the error code. This gets converted at
+		 * userlevel to a return value of -1 and the error
+		 * code in errno.
+		 */
+		tf->tf_v0 = err;
+		tf->tf_a3 = 1;      /* signal an error */
+	}
+	else {
+		/* Success. */
+		if(callno != SYS_fork)
+		{
+			tf->tf_v0 = retval;	
+		}
+
+		tf->tf_a3 = 0;      /* signal no error */
+	}
+	
+	/*
+	 * Now, advance the program counter, to avoid restarting
+	 * the syscall over and over again.
+	 */
+	
+	tf->tf_epc += 4;
+       /* save_trapframe = storeTrapframe(tf);*/
+	/*splx(s);*/
+	/* Make sure the syscall code didn't forget to lower spl */
+	assert(curspl==0);
+}
+
+void
+md_forkentry(struct trapframe *tf, unsigned int vmspace)
+{
+
+	struct trapframe child_kstack;
+
+       /* copy trapframe of parent to chile procss*/
+	memcpy(&child_kstack, tf, sizeof(struct trapframe));
+       /* release trapframe when allocated at function process*/
+	kfree(tf);
+
+       /* activate addrspace*/
+	as_activate((struct addrspace *)vmspace);
+
+       /* increment pc*/
+	child_kstack.tf_epc += 4;
+	child_kstack.tf_v0 = 0;
+	child_kstack.tf_a3 = 0;
+
+       /* release lock so that other process can execute process_fork*/
+//	lock_release(forklock);
+
+       /* execute chile process*/
+	mips_usermode(&child_kstack);
+
+
+
+}
